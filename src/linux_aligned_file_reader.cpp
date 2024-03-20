@@ -15,7 +15,7 @@ namespace
 typedef struct io_event io_event_t;
 typedef struct iocb iocb_t;
 
-void execute_io(io_context_t ctx, int fd, std::vector<AlignedRead> &read_reqs, uint64_t n_retries = 0)
+void execute_io(io_context_t ctx, int fd, std::vector<AlignedRead> &read_reqs, uint64_t n_retries = 10)
 {
 #ifdef DEBUG
     for (auto &req : read_reqs)
@@ -50,33 +50,65 @@ void execute_io(io_context_t ctx, int fd, std::vector<AlignedRead> &read_reqs, u
             cbs[i] = cb.data() + i;
         }
 
-        uint64_t n_tries = 0;
-        while (n_tries <= n_retries)
+        int64_t ret;
+        int64_t num_submitted = 0;
+        uint64_t submit_retry = 0;
+        while (num_submitted < n_ops)
         {
-            // issue reads
-            int64_t ret = io_submit(ctx, (int64_t)n_ops, cbs.data());
-            // if requests didn't get accepted
-            if (ret != (int64_t)n_ops)
+            while ((ret = io_submit(ctx, n_ops - num_submitted, cbs.data() + num_submitted)) < 0)
             {
-                std::cerr << "io_submit() failed; returned " << ret << ", expected=" << n_ops << ", ernno=" << errno
-                          << "=" << ::strerror(-ret) << ", try #" << n_tries + 1;
-                std::cout << "ctx: " << ctx << "\n";
-                exit(-1);
-            }
-            else
-            {
-                // wait on io_getevents
-                ret = io_getevents(ctx, (int64_t)n_ops, (int64_t)n_ops, evts.data(), nullptr);
-                // if requests didn't complete
-                if (ret != (int64_t)n_ops)
+                if (-ret != EINTR)
                 {
-                    std::cerr << "io_getevents() failed; returned " << ret << ", expected=" << n_ops
-                              << ", ernno=" << errno << "=" << ::strerror(-ret) << ", try #" << n_tries + 1;
-                    exit(-1);
+                    std::stringstream err;
+                    err << "Unknown error occur in io_submit, errno: " << -ret << ", " << strerror(-ret);
+                    throw diskann::ANNException(err.str(), -1, __FUNCSIG__, __FILE__, __LINE__);
+                }
+            }
+            num_submitted += ret;
+            if (num_submitted < n_ops)
+            {
+                submit_retry++;
+                if (submit_retry <= n_retries)
+                {
+                    diskann::cerr << "io_submit() failed; submit: " << num_submitted << ", expected: " << n_ops
+                                  << ", retry: " << submit_retry;
                 }
                 else
                 {
-                    break;
+                    std::stringstream err;
+                    err << "io_submit failed after retried " << n_retries << " times";
+                    throw diskann::ANNException(err.str(), -1, __FUNCSIG__, __FILE__, __LINE__);
+                }
+            }
+        }
+
+        int64_t num_read = 0;
+        uint64_t read_retry = 0;
+        while (num_read < n_ops)
+        {
+            while ((ret = io_getevents(ctx, n_ops - num_read, n_ops - num_read, evts.data() + num_read, nullptr)) < 0)
+            {
+                if (-ret != EINTR)
+                {
+                    std::stringstream err;
+                    err << "Unknown error occur in io_getevents, errno: " << -ret << ", " << strerror(-ret);
+                    throw diskann::ANNException(err.str(), -1, __FUNCSIG__, __FILE__, __LINE__);
+                }
+            }
+            num_read += ret;
+            if (num_read < n_ops)
+            {
+                read_retry++;
+                if (read_retry <= n_retries)
+                {
+                    diskann::cerr << "io_getevents() failed; read: " << num_read << ", expected: " << n_ops
+                                  << ", retry: " << read_retry;
+                }
+                else
+                {
+                    std::stringstream err;
+                    err << "io_getevents failed after retried " << n_retries << " times";
+                    throw diskann::ANNException(err.str(), -1, __FUNCSIG__, __FILE__, __LINE__);
                 }
             }
         }
